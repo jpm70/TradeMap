@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Business Finder Pro - Final</title>
+    <title>TradeMap — Buscador de negocios</title>
     
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -90,18 +90,29 @@
     const input = document.getElementById('ciudadInput');
     const suggBox = document.getElementById('suggestions');
 
-    input.addEventListener('input', async () => {
+    // Photon sin sesgo devuelve "Alicante" de Filipinas antes que la de España: sesgamos hacia España
+    const photonURL = (q, limit) =>
+        `https://photon.komoot.io/api/?q=${encodeURIComponent(q)}&limit=${limit}&lat=40.4&lon=-3.7&location_bias_scale=0.5&osm_tag=place`;
+
+    let debounceT = null;
+    input.addEventListener('input', () => {
+        ciudadCoords = null; // si el texto cambia, las coordenadas anteriores ya no valen
+        clearTimeout(debounceT);
+        debounceT = setTimeout(autocompletar, 300);
+    });
+
+    async function autocompletar() {
         const val = input.value.trim();
         if (val.length < 3) { suggBox.style.display = 'none'; return; }
 
         try {
-            const res = await fetch(`https://photon.komoot.io/api/?q=${encodeURIComponent(val)}&limit=5`);
+            const res = await fetch(photonURL(val, 5));
             const data = await res.json();
             suggBox.innerHTML = "";
             data.features.forEach(f => {
                 const div = document.createElement('div');
                 div.className = 'suggestion-item';
-                div.innerText = `${f.properties.name} (${f.properties.state || ''}, ${f.properties.country})`;
+                div.innerText = [f.properties.name, f.properties.state, f.properties.country].filter(Boolean).join(', ');
                 div.onclick = () => {
                     ciudadCoords = { lat: f.geometry.coordinates[1], lon: f.geometry.coordinates[0] };
                     input.value = f.properties.name;
@@ -112,37 +123,58 @@
             });
             suggBox.style.display = 'block';
         } catch (e) { console.log("Autocomplete error"); }
-    });
+    }
 
     async function realizarBusqueda() {
         const tag = document.getElementById('actividad').value;
         const status = document.getElementById('status');
         
-        // Si no seleccionó de la lista, intentamos buscar el área por nombre como plan B
+        // Si no eligió de la lista, geocodificamos el texto con Photon (primer resultado)
         if (!ciudadCoords) {
             const ciudadTexto = input.value.trim();
             if (!ciudadTexto) return alert("Escribe una ciudad");
-            
+
             status.style.display = "block";
-            const queryArea = `[out:json];area["name"="${ciudadTexto}"]["admin_level"~"4|8"];out center;`;
             try {
-                const res = await fetch("https://overpass-api.de/api/interpreter?data=" + encodeURIComponent(queryArea));
+                const res = await fetch(photonURL(ciudadTexto, 1));
                 const data = await res.json();
-                if (data.elements[0]) {
-                    const c = data.elements[0].center || data.elements[0];
-                    ciudadCoords = { lat: c.lat, lon: c.lon };
-                } else {
-                    status.style.display = "none";
-                    return alert("Selecciona una ciudad de la lista de sugerencias que aparece al escribir.");
-                }
-            } catch (e) { alert("Error buscando ciudad"); return; }
+                const f = data.features && data.features[0];
+                if (!f) { status.style.display = "none"; return alert("No encuentro esa ciudad. Prueba con otro nombre."); }
+                ciudadCoords = { lat: f.geometry.coordinates[1], lon: f.geometry.coordinates[0] };
+                map.setView([ciudadCoords.lat, ciudadCoords.lon], 13);
+            } catch (e) { status.style.display = "none"; return alert("No se pudo buscar la ciudad. Inténtalo de nuevo."); }
         }
 
-        const query = `[out:json][timeout:30];
+        const query = `[out:json][timeout:20];
             (node[${tag}](around:3000, ${ciudadCoords.lat}, ${ciudadCoords.lon});
              way[${tag}](around:3000, ${ciudadCoords.lat}, ${ciudadCoords.lon}););
             out center;`;
         ejecutarQuery(query);
+    }
+
+    const OVERPASS = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://overpass.private.coffee/api/interpreter"
+    ];
+
+    async function overpass(query) {
+        let ultimo;
+        for (const url of OVERPASS) {
+            const ctl = new AbortController();
+            const t = setTimeout(() => ctl.abort(), 25000);
+            try {
+                const res = await fetch(url + "?data=" + encodeURIComponent(query), { signal: ctl.signal });
+                if (!res.ok) throw new Error("HTTP " + res.status);
+                return await res.json();
+            } catch (e) { ultimo = e; }
+            finally { clearTimeout(t); }
+        }
+        throw ultimo;
+    }
+
+    function esc(t) {
+        return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
 
     async function ejecutarQuery(query) {
@@ -150,27 +182,28 @@
         status.style.display = "block";
         marcadores.clearLayers();
         try {
-            const res = await fetch("https://overpass-api.de/api/interpreter?data=" + encodeURIComponent(query));
-            const data = await res.json();
+            const data = await overpass(query);
             data.elements.forEach(el => {
-                const lat = el.lat || el.center.lat, lon = el.lon || el.center.lon;
+                const lat = el.lat ?? el.center.lat, lon = el.lon ?? el.center.lon;
                 const icon = L.divIcon({ html: `<i class="fa-solid fa-location-dot"></i>`, className: 'custom-div-icon', iconSize:[30,30], iconAnchor:[15,15] });
+                const nombre = esc((el.tags && el.tags.name) || "Negocio");
                 L.marker([lat, lon], {icon}).addTo(marcadores)
-                    .bindPopup(`<b style="color:#333">${el.tags.name || "Negocio"}</b><br>
-                                <a href="https://www.google.com/maps/dir/?api=1&destination=${lat},${lon}" target="_blank" class="btn-route">Cómo llegar</a>`);
+                    .bindPopup(`<b style="color:#333">${nombre}</b><br>
+                                <a href="https://www.google.com/maps/dir/?api=1&destination=${lat},${lon}" target="_blank" rel="noopener" class="btn-route">Cómo llegar</a>`);
             });
-            if (data.elements.length === 0) alert("No se encontraron resultados.");
-        } catch (e) { alert("Error de red"); }
+            if (data.elements.length === 0) alert("No se encontraron resultados en 3 km a la redonda.");
+        } catch (e) { alert("Los servidores de mapas (Overpass) no responden ahora mismo. Inténtalo de nuevo en un minuto."); }
         status.style.display = "none";
     }
 
     function usarUbicacion() {
+        if (!navigator.geolocation) return alert("Tu navegador no permite geolocalización.");
         navigator.geolocation.getCurrentPosition(pos => {
             ciudadCoords = { lat: pos.coords.latitude, lon: pos.coords.longitude };
             input.value = "Mi ubicación";
             map.setView([ciudadCoords.lat, ciudadCoords.lon], 15);
             realizarBusqueda();
-        });
+        }, () => alert("No se pudo obtener tu ubicación (¿permiso denegado?)."));
     }
 </script>
 </body>
